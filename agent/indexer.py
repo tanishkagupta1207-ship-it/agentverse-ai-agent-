@@ -1,3 +1,4 @@
+import math
 import re
 
 import chromadb
@@ -82,10 +83,15 @@ def _all_chunks(col):
 
 def _keyword_ranking(col, query):
     toks = _tokens(query)
+    rows = _all_chunks(col)
+    lows = [doc.lower() for _, doc, _ in rows]
+    n = len(rows)
+    # rare words matter more: 'request' appears everywhere in the requests repo
+    idf = {t: math.log((n + 1) / (1 + sum(t in low for low in lows))) for t in toks}
     scored = []
-    for cid, doc, meta in _all_chunks(col):
-        sym, low = meta["symbol"].lower(), doc.lower()
-        s = sum(3 * (t in sym) + min(low.count(t), 5) for t in toks)
+    for (cid, _, meta), low in zip(rows, lows):
+        sym = meta["symbol"].lower()
+        s = sum(idf[t] * (3 * (t in sym) + min(low.count(t), 5)) for t in toks)
         if s > 0:
             scored.append((s, cid))
     scored.sort(reverse=True)
