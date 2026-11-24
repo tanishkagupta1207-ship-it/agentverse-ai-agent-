@@ -1,3 +1,5 @@
+import re
+
 import chromadb
 
 try:
@@ -7,6 +9,15 @@ except ImportError:
 
 DB_PATH = "chroma_db"
 COLLECTION = "code_chunks"
+
+STOPWORDS = {
+    "how", "are", "is", "was", "were", "where", "what", "when", "why", "which",
+    "who", "does", "do", "did", "the", "a", "an", "in", "of", "to", "and", "or",
+    "for", "it", "this", "that", "with", "from", "by", "on", "at", "be", "as",
+    "can", "i", "me", "my", "used", "use", "work", "works",
+}
+
+_cache = {}  # all chunks, loaded once per collection size
 
 
 def get_collection(embedding_function=None):
@@ -19,10 +30,10 @@ def get_collection(embedding_function=None):
 
 def index_repo(repo_root, reset=True, embedding_function=None):
     """Chunk the repo and store every chunk in ChromaDB."""
-    if reset:
-        chromadb.PersistentClient(path=DB_PATH).delete_collection(COLLECTION) \
-            if COLLECTION in [c.name for c in chromadb.PersistentClient(path=DB_PATH).list_collections()] \
-            else None
+    client = chromadb.PersistentClient(path=DB_PATH)
+    if reset and COLLECTION in [c.name for c in client.list_collections()]:
+        client.delete_collection(COLLECTION)
+    _cache.clear()
     col = get_collection(embedding_function)
     chunks = chunk_repo(repo_root)
 
@@ -41,18 +52,81 @@ def index_repo(repo_root, reset=True, embedding_function=None):
     return len(chunks)
 
 
-def search_code(query, k=5, embedding_function=None):
-    """Tool for the agent. Same return style as B's tools."""
+def _tokens(query):
+    words = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", query.lower())
+    out = []
+    for w in words:
+        if w in STOPWORDS or len(w) < 3:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):   # crude stemming
+            if w.endswith(suffix) and len(w) - len(suffix) >= 4:
+                w = w[: -len(suffix)]
+                break
+        out.append(w)
+    return out
+
+
+def _is_test(path):
+    p = path.lower()
+    return p.startswith("tests/") or "/tests/" in p or p.split("/")[-1].startswith("test_")
+
+
+def _all_chunks(col):
+    n = col.count()
+    if _cache.get("n") != n:
+        data = col.get(include=["documents", "metadatas"])
+        _cache["n"] = n
+        _cache["rows"] = list(zip(data["ids"], data["documents"], data["metadatas"]))
+    return _cache["rows"]
+
+
+def _keyword_ranking(col, query):
+    toks = _tokens(query)
+    scored = []
+    for cid, doc, meta in _all_chunks(col):
+        sym, low = meta["symbol"].lower(), doc.lower()
+        s = sum(3 * (t in sym) + min(low.count(t), 5) for t in toks)
+        if s > 0:
+            scored.append((s, cid))
+    scored.sort(reverse=True)
+    return [cid for _, cid in scored[:50]]
+
+
+def search_code(query, k=5, embedding_function=None, test_penalty=0.5):
+    """Agent tool: hybrid search (embeddings + keywords), tests ranked lower."""
     col = get_collection(embedding_function)
-    res = col.query(query_texts=[query], n_results=k)
+    if col.count() == 0:
+        return {"found": False, "results": [], "evidence": [],
+                "note": "Index is empty. Run index_repo first."}
+
+    sem = col.query(query_texts=[query], n_results=min(30, col.count()))
+    sem_ids = sem["ids"][0]
+    sem_dist = dict(zip(sem_ids, sem["distances"][0]))
+    kw_ids = _keyword_ranking(col, query)
+
+    # Reciprocal rank fusion of the two rankings
+    score = {}
+    for rank, cid in enumerate(sem_ids):
+        score[cid] = score.get(cid, 0) + 1 / (60 + rank)
+    for rank, cid in enumerate(kw_ids):
+        score[cid] = score.get(cid, 0) + 1 / (60 + rank)
+
+    rows = {cid: (doc, meta) for cid, doc, meta in _all_chunks(col)}
+    for cid in score:
+        if _is_test(rows[cid][1]["path"]):
+            score[cid] *= test_penalty
+
+    top = sorted(score, key=score.get, reverse=True)[:k]
     results = []
-    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+    for cid in top:
+        doc, meta = rows[cid]
         results.append({
             "path": meta["path"],
             "symbol": meta["symbol"],
             "start_line": meta["start_line"],
             "end_line": meta["end_line"],
-            "distance": round(dist, 4),
+            "distance": round(sem_dist[cid], 4) if cid in sem_dist else None,
+            "score": round(score[cid], 5),
             "text": doc[:1500],
         })
     evidence = [{"type": "code", "path": r["path"],
@@ -70,7 +144,8 @@ if __name__ == "__main__":
     root = sys.argv[1] if len(sys.argv) > 1 else "repos/requests"
     print(f"Indexed {index_repo(root)} chunks")
     for q in ["how are cookies handled in a session",
-              "where are redirects followed"]:
+              "where are redirects followed",
+              "how does authentication work"]:
         print(f"\nQ: {q}")
-        for r in search_code(q, k=3)["results"]:
-            print(f"- {r['path']}:{r['start_line']}-{r['end_line']}  {r['symbol']}  (d={r['distance']})")
+        for r in search_code(q, k=5)["results"]:
+            print(f"- {r['path']}:{r['start_line']}-{r['end_line']}  {r['symbol']}")
