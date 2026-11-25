@@ -3,7 +3,7 @@ from db import init_db
 
 
 def get_issue_or_pr(number):
-    """Ek issue ya PR ki details. A ka agent isko tool ki tarah call karega."""
+    """Tool for the agent: returns the details of one issue or pull request."""
     conn = init_db()
     row = conn.execute(
         "SELECT number, title, body, state, labels, created_at, updated_at, is_pr "
@@ -24,7 +24,7 @@ def get_issue_or_pr(number):
         "number": row[0],
         "kind": kind,
         "title": row[1],
-        "body": (row[2] or "")[:1500],  # bahut lamba body agent ko mat bhejo
+        "body": (row[2] or "")[:1500],  # truncate very long bodies before sending to the agent
         "state": row[3],
         "labels": [l for l in (row[4] or "").split(",") if l],
         "created_at": row[5],
@@ -35,7 +35,7 @@ def get_issue_or_pr(number):
 
 
 def list_issues(state="open", labels=None, include_prs=False, limit=20):
-    """Issues ki list. state: open / closed / all. labels: ['bug', ...]"""
+    """Tool for the agent: lists issues. state is open, closed or all."""
     conn = init_db()
     query = (
         "SELECT number, title, state, labels, created_at, updated_at, is_pr, length(body) "
@@ -87,4 +87,3 @@ if __name__ == "__main__":
     for i in r["issues"]:
         kind = "PR" if i["is_pr"] else "Issue"
         print(f"- {kind} #{i['number']} [{i['state']}] {i['title']}")
-        

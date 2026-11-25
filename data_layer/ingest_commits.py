@@ -3,7 +3,7 @@ from git import Repo
 from db import init_db
 
 REPO_PATH = "repos/requests"
-MAX_COMMITS = 500  # abhi chhota rakha hai taaki jaldi chale
+MAX_COMMITS = 500  # keep this small for now so it runs fast
 REF_PATTERN = re.compile(r"#(\d+)")
 
 conn = init_db()
