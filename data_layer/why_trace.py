@@ -10,7 +10,7 @@ def trace(path, start, end):
     conn = init_db()
     repo = Repo(REPO_PATH)
 
-    # in lines ko chhune wale saare commits (naya se purana)
+    # All commits that touched these lines (newest first)
     out = repo.git.log(f"-L{start},{end}:{path}", "-s", "--format=%H")
     shas = list(dict.fromkeys(l.strip() for l in out.splitlines() if len(l.strip()) == 40))
 
@@ -33,6 +33,7 @@ def trace(path, start, end):
             "linked": linked,
         })
 
+    # If no commit links to an issue or PR, there is no explanation available
     has_reason = any(t["linked"] for t in timeline)
     return {
         "path": path,
@@ -43,7 +44,7 @@ def trace(path, start, end):
 
 
 def git_history(path, start_line, end_line):
-    """A ka agent isi function ko tool ki tarah call karega."""
+    """Tool for the agent: explains the history behind a range of lines."""
     r = trace(path, start_line, end_line)
     evidence = []
     for t in r["timeline"]:

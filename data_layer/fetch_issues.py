@@ -13,7 +13,7 @@ HEADERS = {
 
 conn = init_db()
 
-# sirf wahi issues/PRs layenge jo commits mein mention hue hain
+# Only fetch the issues/PRs that are mentioned in commit messages
 numbers = [r[0] for r in conn.execute("SELECT DISTINCT issue_number FROM commit_refs")]
 already = {r[0] for r in conn.execute("SELECT number FROM issues")}
 
@@ -21,7 +21,7 @@ saved = skipped = missing = 0
 
 for n in numbers:
     if n in already:
-        skipped += 1  # cache: dobara API call nahi
+        skipped += 1  # cache hit: do not call the API again
         continue
     resp = requests.get(
         f"https://api.github.com/repos/{OWNER_REPO}/issues/{n}", headers=HEADERS
