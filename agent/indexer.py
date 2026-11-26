@@ -1,12 +1,13 @@
 import math
 import re
+from pathlib import Path
 
 import chromadb
 
 try:
-    from agent.chunker import chunk_repo
+    from agent.chunker import chunk_file, chunk_repo
 except ImportError:
-    from chunker import chunk_repo
+    from chunker import chunk_file, chunk_repo
 
 DB_PATH = "chroma_db"
 COLLECTION = "code_chunks"
@@ -29,6 +30,21 @@ def get_collection(embedding_function=None):
     return client.get_or_create_collection(**kwargs)
 
 
+def _upsert(col, chunks):
+    for i in range(0, len(chunks), 200):
+        batch = chunks[i:i + 200]
+        col.upsert(
+            ids=[c["id"] for c in batch],
+            documents=[c["text"] for c in batch],
+            metadatas=[{
+                "path": c["path"],          # repo-relative, forward slashes
+                "symbol": c["symbol"],
+                "start_line": c["start_line"],
+                "end_line": c["end_line"],
+            } for c in batch],
+        )
+
+
 def index_repo(repo_root, reset=True, embedding_function=None):
     """Chunk the repo and store every chunk in ChromaDB."""
     client = chromadb.PersistentClient(path=DB_PATH)
@@ -37,19 +53,34 @@ def index_repo(repo_root, reset=True, embedding_function=None):
     _cache.clear()
     col = get_collection(embedding_function)
     chunks = chunk_repo(repo_root)
+    _upsert(col, chunks)
+    return len(chunks)
 
-    for i in range(0, len(chunks), 200):
-        batch = chunks[i:i + 200]
-        col.upsert(
-            ids=[c["id"] for c in batch],
-            documents=[c["text"] for c in batch],
-            metadatas=[{
-                "path": c["path"],
-                "symbol": c["symbol"],
-                "start_line": c["start_line"],
-                "end_line": c["end_line"],
-            } for c in batch],
-        )
+
+def delete_file_chunks(path, embedding_function=None):
+    """Delete every chunk whose metadata 'path' equals path. Returns how many."""
+    path = path.replace("\\", "/")
+    col = get_collection(embedding_function)
+    ids = col.get(where={"path": path}, include=[])["ids"]
+    if ids:
+        col.delete(ids=ids)
+    _cache.clear()
+    return len(ids)
+
+
+def index_file(repo_root, path, embedding_function=None):
+    """Re-index one file without a full reset: drop its old chunks, add fresh ones.
+    path is relative to repo_root. If the file no longer exists, its chunks are
+    just removed. Returns the number of chunks added."""
+    path = path.replace("\\", "/")
+    delete_file_chunks(path, embedding_function)
+    full = Path(repo_root) / path
+    if not full.is_file():
+        return 0
+    chunks = chunk_file(repo_root, full)
+    if chunks:
+        _upsert(get_collection(embedding_function), chunks)
+    _cache.clear()
     return len(chunks)
 
 
