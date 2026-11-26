@@ -34,7 +34,18 @@ def trace(path, start, end):
         })
 
     # If no commit links to an issue or PR, there is no explanation available
-    has_reason = any(t["linked"] for t in timeline)
+    reason_words = (
+        "fix", "bug", "because", "regression", "crash",
+        "security", "leak", "avoid", "deprecat", "broken",
+    )
+    has_reason = any(
+        t["linked"]
+        and any(
+            w in (t["message"] + " " + " ".join(i["title"] for i in t["linked"])).lower()
+            for w in reason_words
+        )
+        for t in timeline
+    )
     return {
         "path": path,
         "lines": [start, end],
