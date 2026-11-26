@@ -5,6 +5,11 @@ from db import init_db
 REPO_PATH = "repos/requests"
 REF_PATTERN = re.compile(r"#(\d+)")
 
+# Commits about tooling, not design: they never explain why code exists
+NOISE_PATTERN = re.compile(
+    r"\b(ci|build|lint\w*|format\w*|pyright|bump|types?|annotations?)\b"
+)
+
 
 def trace(path, start, end):
     conn = init_db()
@@ -34,7 +39,19 @@ def trace(path, start, end):
         })
 
     # If no commit links to an issue or PR, there is no explanation available
-    has_reason = any(t["linked"] for t in timeline)
+    reason_words = (
+        "fix", "bug", "because", "regression", "crash",
+        "security", "leak", "avoid", "deprecat", "broken",
+    )
+    def _text(t):
+        return (t["message"] + " " + " ".join(i["title"] for i in t["linked"])).lower()
+
+    has_reason = any(
+        t["linked"]
+        and not NOISE_PATTERN.search(_text(t))
+        and any(w in _text(t) for w in reason_words)
+        for t in timeline
+    )
     return {
         "path": path,
         "lines": [start, end],
