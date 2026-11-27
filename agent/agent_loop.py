@@ -10,24 +10,28 @@ from pydantic import ValidationError
 try:
     from agent.claims import AnswerResult
     from agent.indexer import search_code
-    from agent.verifier import verify_existence
+    from agent.verifier import verify_existence, verify_semantic
+    from agent.code_tools import get_callers, get_symbol
 except ImportError:
     from claims import AnswerResult
     from indexer import search_code
-    from verifier import verify_existence
+    from verifier import verify_existence, verify_semantic
+    from code_tools import get_callers, get_symbol
 
 load_dotenv()
-MAX_STEPS = 10
-MAX_TOOL_STEPS = 4   # tool rounds before final_answer is forced
+MAX_STEPS = 14
+MAX_TOOL_STEPS = 6   # tool rounds before final_answer is forced
 MAX_TOOL_CHARS = 3500
 
 SYSTEM_PROMPT = """You are Oracle Onboard, an assistant that answers questions about a Python repository.
 Use the tools to find evidence. Do not answer from memory.
-Use ONLY the tools provided (search_code, git_history, get_issue_or_pr, list_issues, final_answer). Never call any other tool, such as open_file or browsing tools.
+Use ONLY the tools provided (search_code, get_symbol, get_callers, git_history, get_issue_or_pr, list_issues, final_answer). Never call any other tool, such as open_file or browsing tools.
+Make at most 5 tool calls in total before answering.
+Do not repeat a search for something you already found. Once get_symbol or search_code returns the code you need, move on or answer.
 
 When you are done, call final_answer exactly once. Rules:
 - Each claim is ONE fact. Split compound statements into separate claims.
-- label "verified": backed by code evidence from search_code results: type "code", path, and start/end = that result's start_line/end_line.
+- label "verified": backed by code evidence: type "code", path, and start/end = a search_code/get_symbol result's start_line/end_line, or a get_callers entry's path and line (use line for both start and end).
 - label "history_backed": backed by a commit, issue or pr copied from git_history / get_issue_or_pr results.
 - label "assumption": your own inference. It must have an empty evidence list.
 - Only cite evidence that appeared in tool results. Never invent paths, line numbers, SHAs or numbers.
@@ -44,6 +48,16 @@ TOOL_SPECS = [
             "query": {"type": "string"},
             "k": {"type": "integer", "description": "number of results, default 5"}},
             "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_symbol",
+        "description": "Find where a function, method or class is defined, e.g. 'Session.send' or 'resolve_redirects'.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "get_callers",
+        "description": "Find call sites of a function or method, with the function each call sits in.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "git_history",
         "description": "Commits (and linked issues/PRs) that touched a line range of a file. Use for 'why' questions.",
@@ -101,7 +115,8 @@ def default_tools():
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data_layer"))
     from why_trace import git_history
     from issue_tools import get_issue_or_pr, list_issues
-    return {"search_code": search_code, "git_history": git_history,
+    return {"search_code": search_code, "get_symbol": get_symbol,
+            "get_callers": get_callers, "git_history": git_history,
             "get_issue_or_pr": get_issue_or_pr, "list_issues": list_issues}
 
 
@@ -118,7 +133,10 @@ def _compact(name, r):
     """Shrink tool output so each request stays small (free tiers have token limits)."""
     if not isinstance(r, dict):
         return r
-    if name == "search_code":
+    if name == "get_callers":
+        return {"found": r.get("found"), "note": r.get("note"),
+                "callers": r.get("callers", [])[:12]}
+    if name in ("search_code", "get_symbol"):
         return {"found": r.get("found"), "note": r.get("note"),
                 "results": [{"path": x["path"], "symbol": x["symbol"],
                              "start_line": x["start_line"], "end_line": x["end_line"],
@@ -145,8 +163,8 @@ def _run_tool(tools, name, args):
 
 
 def run_agent(question, client=None, tools=None, model=None, verify_kwargs=None,
-              verbose=False):
-    """Returns (AnswerResult after stage-1 verification, downgrade log, tool_trace)."""
+              verbose=False, semantic=None, semantic_kwargs=None):
+    """Returns (AnswerResult after verification, downgrade log, tool_trace)."""
     client = client or make_client()
     tools = tools or default_tools()
     model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -157,37 +175,50 @@ def run_agent(question, client=None, tools=None, model=None, verify_kwargs=None,
     bad_calls = 0
     tool_steps = 0
     nudged = False
+    force_ok=True
 
     for step in range(1, MAX_STEPS + 1):
+        over_budget = tool_steps >= MAX_TOOL_STEPS
+        if over_budget and not nudged:
+            nudged = True
+            messages.append({"role": "user", "content": (
+                "You have enough evidence. Call final_answer now with what you found. "
+                "If the evidence only partly answers the question, give the claims you can "
+                "support and mark the rest as assumption. Use not_found only if nothing "
+                "relevant was found, and then explain why in note.")})
+        # ALWAYS send every tool spec: the API rejects calls to tools that are
+        # not in the request. The budget is enforced below, not by hiding tools.
+        choice = ({"type": "function", "function": {"name": "final_answer"}}
+            if over_budget and force_ok else "auto")
         try:
-            if tool_steps >= MAX_TOOL_STEPS:
-                # enough searching: only final_answer is allowed from here on
-                if not nudged:
-                    nudged = True
-                    messages.append({"role": "user", "content": (
-                        "You have enough evidence. Call final_answer now.")})
-                specs = [t for t in TOOL_SPECS if t["function"]["name"] == "final_answer"]
-                choice = {"type": "function", "function": {"name": "final_answer"}}
-            else:
-                specs, choice = TOOL_SPECS, "auto"
             resp = client.chat.completions.create(
-                model=model, messages=messages, tools=specs, tool_choice=choice)
+                model=model, messages=messages, tools=TOOL_SPECS, tool_choice=choice)
         except Exception as e:
             err = str(e).lower()
-            # model called a tool we never offered, or produced unparseable output
+            if "tool choice is required" in err or "did not call a tool" in err:
+                if verbose:
+                    print(f"step {step}: forced final_answer failed, retrying without forcing")
+                force_ok = False
+                messages.append({"role": "user", "content": (
+                    "Call the final_answer tool now. Keep it short: at most 4 claims, "
+                    "each under 20 words, valid JSON only.")})
+                continue
             malformed = any(k in err for k in (
                 "tool call validation failed", "parsing failed",
                 "failed to parse", "could not be parsed"))
-            if malformed and bad_calls < 4:
-                bad_calls += 1
-                if verbose:
-                    print(f"step {step}: malformed tool call, asking the model to retry")
-                messages.append({"role": "user", "content": (
-                    "Your last output was invalid. Call one tool with valid JSON arguments. "
-                    "Use only: search_code, git_history, get_issue_or_pr, list_issues, "
-                    "final_answer.")})
-                continue
-            # free-tier rate limits: wait and retry a few times
+            if malformed:
+                if bad_calls < 4:
+                    bad_calls += 1
+                    if verbose:
+                        print(f"step {step}: malformed tool call, asking the model to retry")
+                    messages.append({"role": "user", "content": (
+                        "Your last output was invalid. Call one tool with valid JSON arguments. "
+                        "Use only: search_code, get_symbol, get_callers, git_history, "
+                        "get_issue_or_pr, list_issues, final_answer.")})
+                    continue
+                return (AnswerResult(not_found=True,
+                                     note="The model kept producing invalid tool calls."),
+                        [], trace)
             if any(k in err for k in ("rate limit", "tokens per minute", "429", "413")):
                 if waits < 3:
                     waits += 1
@@ -199,6 +230,8 @@ def run_agent(question, client=None, tools=None, model=None, verify_kwargs=None,
         msg = resp.choices[0].message
 
         if not msg.tool_calls:  # model replied with text: push it to submit
+            if verbose:
+                print(f"step {step}: text reply, asking for final_answer")
             messages.append({"role": "assistant", "content": msg.content or ""})
             messages.append({"role": "user",
                              "content": "Submit your answer by calling final_answer."})
@@ -228,8 +261,13 @@ def run_agent(question, client=None, tools=None, model=None, verify_kwargs=None,
                     final = None
                     result = f"Invalid answer, fix and call final_answer again: {e}"
             elif name in tools:
-                trace.append({"tool": name, "args": args})
-                result = _run_tool(tools, name, args)
+                if over_budget:
+                    result = json.dumps({"error": "Tool budget used up. Call final_answer now."})
+                else:
+                    trace.append({"tool": name, "args": args})
+                    result = _run_tool(tools, name, args)
+                    if verbose:
+                        print(f"    {name}({args}) -> {result[:200]}")
             else:
                 result = json.dumps({"error": f"unknown tool {name}"})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -237,6 +275,13 @@ def run_agent(question, client=None, tools=None, model=None, verify_kwargs=None,
         tool_steps += 1
         if final is not None:
             checked, log = verify_existence(final, **(verify_kwargs or {}))
+            if semantic is None:
+                semantic = os.getenv("SKIP_SEMANTIC") != "1"
+            if semantic and checked.claims:
+                if verbose:
+                    print("verifying claims against their evidence...")
+                checked, log2 = verify_semantic(checked, **(semantic_kwargs or {}))
+                log = log + log2
             return checked, log, trace
 
     return (AnswerResult(not_found=True, note="Agent did not finish within the step limit."),
@@ -248,7 +293,7 @@ if __name__ == "__main__":
     answer, log, trace = run_agent(q, verbose=True)
     print("Tools used:", [t["tool"] for t in trace])
     if answer.not_found:
-        print("NOT FOUND:", answer.note or "")
+        print("NOT FOUND:", answer.note or "(model gave no reason)")
     for c in answer.claims:
         print(f"\n[{c.label}] {c.text}")
         for e in c.evidence:
@@ -256,4 +301,6 @@ if __name__ == "__main__":
         if c.note:
             print("    note:", c.note)
     if log:
-        print("\nDowngrades:", log)
+        print("\nVerifier log:")
+        for entry in log:
+            print("  ", entry)
